@@ -24,6 +24,20 @@ $Port = if ($env:MELVOR_BRIDGE_PORT) { $env:MELVOR_BRIDGE_PORT } else { '27500' 
 if (-not (Test-Path $BridgeDll)) { throw "找不到 $BridgeDll，请先 build。" }
 if (-not (Test-Path (Join-Path $GameDir 'Melvor2.exe'))) { throw "找不到游戏 $GameDir\Melvor2.exe" }
 
+# Steamworks 需要 Steam 客户端在线（IPC），没有就先拉起并等待
+$steamProc = Get-Process steam -ErrorAction SilentlyContinue
+if (-not $steamProc) {
+    Write-Host '[bridge] Steam 未运行，正在启动 Steam...'
+    Start-Process 'steam://open/games'
+    $ok = $false
+    foreach ($i in 1..30) {
+        Start-Sleep -Seconds 3
+        if ((Get-Process steam -ErrorAction SilentlyContinue) -and (Get-Process steamwebhelper -ErrorAction SilentlyContinue)) { $ok = $true; break }
+    }
+    if ($ok) { Start-Sleep -Seconds 10; Write-Host '[bridge] Steam 已就绪' }
+    else { Write-Warning '[bridge] Steam 未能在 90 秒内就绪，继续尝试启动游戏（可能失败）' }
+}
+
 # steam_appid.txt 让直接启动的 exe 也能初始化 Steamworks（Steam 客户端需在线）
 $appidFile = Join-Path $GameDir 'steam_appid.txt'
 if (-not (Test-Path $appidFile)) {
