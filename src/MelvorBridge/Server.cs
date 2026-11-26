@@ -1,281 +1,803 @@
+using System.Collections;
+using System.Collections.Concurrent;
+using System.Net;
 using System.Reflection;
+using System.Text.Json;
 
 namespace MelvorBridge;
 
-/// <summary>
-/// 定位并持有游戏对象图：SceneTree → Main → GameDriver →(反射)→ Game。
-/// 早期等待全程纯反射；确认 Godot 就绪之后才允许强类型调用（见 Server）。
-/// GameDriver 在切换存档/重进游戏时会 Bind 新的 Game，因此每次请求都重新解析。
-/// </summary>
-public static class GameContext
+/// <summary>本地 HTTP 控制桥。只监听 127.0.0.1，供本机 AI agent 调用。</summary>
+public static class Server
 {
-    private static volatile bool _godotUp;
-    private static volatile bool _connected;
-    private static volatile bool _connecting;
-    private static object? _gameDriver;
-    private static PropertyInfo? _gameProp;
+    public const string Version = "0.1.0";
+    private static HttpListener? _listener;
 
-    public static bool Ready => _gameDriver != null;
-
-    public static void Run()
+    public static void Start()
     {
-        // HTTP 服务立即上线（/health 可查连接状态）。
-        // 游戏连接由 OnNativeObjectCreated 钩子驱动（注入到 GodotObject ctor，主线程）。
-        Log.Write("bridge thread up (native hook will drive connection)");
-        Server.Start();
-    }
-
-    /// <summary>
-    /// 由注入到 GodotObject..ctor 的回调调用——永远在 Godot 主线程。
-    /// 每次创建 Godot 对象时尝试连接，连上后短路。
-    /// </summary>
-    public static void OnNativeObjectCreated()
-    {
-        EnsureTranslations();
-        if (_connected) return;
-        if (_connecting) return;
-        _connecting = true;
-        try
+        var port = Environment.GetEnvironmentVariable("MELVOR_BRIDGE_PORT") ?? "27500";
+        _listener = new HttpListener();
+        _listener.Prefixes.Add($"http://127.0.0.1:{port}/");
+        _listener.Start();
+        Log.Write($"MelvorBridge {Version} listening on http://127.0.0.1:{port}/");
+        ThreadPool.QueueUserWorkItem(_ =>
         {
-            if (TryConnect())
+            while (_listener.IsListening)
             {
-                _connected = true;
-                Log.Write("connected to game (from native object ctor hook).");
-            }
-        }
-        catch (Exception ex)
-        {
-            Log.Write($"connect attempt: {ex.Message}");
-        }
-        finally { _connecting = false; }
-    }
-
-    private static string? _lastFailReason;
-    private static DateTime _lastFailLog = DateTime.MinValue;
-
-    private static void FailLog(string reason)
-    {
-        // 同原因 15 秒最多记一次，避免云登录等界面刷爆日志
-        if (reason == _lastFailReason && (DateTime.UtcNow - _lastFailLog).TotalSeconds < 15) return;
-        _lastFailReason = reason;
-        _lastFailLog = DateTime.UtcNow;
-        Log.Write($"connect: {reason}");
-    }
-
-    private static bool TryConnect()
-    {
-        var sceneTree = Godot.Engine.GetMainLoop() as Godot.SceneTree;
-        var root = sceneTree?.Root;
-        if (root == null) { FailLog("no root"); return false; }
-
-        var mainNode = FindNodeByTypeFullName(root, "GamesByMalcs.Melvor2.Main");
-        if (mainNode == null)
-        {
-            if (!_treeDumped)
-            {
-                _treeDumped = true;
-                Log.Write("scene tree dump:\n" + DumpTree(root, 0, 4));
-            }
-            FailLog("Main node not found");
-            return false;
-        }
-
-        var gdProp = mainNode.GetType().GetProperty("GameDriver", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-        if (gdProp == null) { FailLog("no GameDriver prop"); return false; }
-        var gd = gdProp.GetValue(mainNode);
-        if (gd == null) { FailLog("GameDriver null"); return false; }
-
-        var gameProp = gd.GetType().GetProperty("Game", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-        if (gameProp == null) { FailLog("no Game prop"); return false; }
-        var game = gameProp.GetValue(gd);
-        if (game == null) { FailLog("game not bound yet (menu?)"); return false; }
-
-        _gameDriver = gd;
-        _gameProp = gameProp;
-        return true;
-    }
-
-    private static bool _treeDumped;
-
-    /// <summary>
-    /// 运行时注册 PCK 内的全部翻译（res://Locale/*.po）。
-    /// 游戏默认只注册 en_GB.po；device_settings/override.cfg 的追加会被游戏重写抹掉，
-    /// 因此在桥启动时（主线程）注册，并按存档保存的语言偏好恢复界面语言。
-    /// </summary>
-    private static bool _translationsDone;
-    private static void EnsureTranslations()
-    {
-        if (_translationsDone) return;
-        _translationsDone = true;
-        try
-        {
-            // 1) 注册 PCK 内所有翻译
-            var pos = new List<string>();
-            var dir = Godot.DirAccess.Open("res://Locale");
-            if (dir != null)
-            {
-                dir.ListDirBegin();
-                while (dir.GetNext() is { } f && f.Length > 0)
-                    if (f.EndsWith(".po")) pos.Add($"res://Locale/{f}");
-                dir.ListDirEnd();
-            }
-            foreach (var po in pos)
-            {
-                if (Godot.ResourceLoader.Exists(po))
+                try
                 {
-                    var t = Godot.ResourceLoader.Load<Godot.Translation>(po);
-                    if (t != null) Godot.TranslationServer.AddTranslation(t);
+                    var ctx = _listener.GetContext();
+                    ThreadPool.QueueUserWorkItem(_ => { try { Handle(ctx); } catch (Exception ex) { Log.Write($"handler crash: {ex}"); } }, ctx);
                 }
+                catch (HttpListenerException) { break; }
+                catch (ObjectDisposedException) { break; }
             }
-            Log.Write($"translations registered: {string.Join(",", Godot.TranslationServer.GetLoadedLocales())}");
+        });
+    }
 
-            // 2) 若游戏启动时因翻译缺失把语言回退成 en_GB，按存档偏好恢复
-            var lsm = Type.GetType("GamesByMalcs.Melvor2.Settings.LocalSettingsManager, GamesByMalcs.Melvor2");
-            var user = lsm?.GetProperty("User", BindingFlags.Static | BindingFlags.Public)?.GetValue(null);
-            var langProp = user?.GetType().GetProperty("Language");
-            string? saved = ReadSavedLanguagePreference();
-            if (!string.IsNullOrEmpty(saved) && saved != (langProp?.GetValue(user) as string)
-                && Godot.TranslationServer.GetLoadedLocales().Contains(saved))
-            {
-                langProp?.SetValue(user, saved);
-                Log.Write($"language restored to saved preference: {saved}");
-            }
+    private static void Handle(HttpListenerContext ctx)
+    {
+        string method, path;
+        try
+        {
+            var req = ctx.Request;
+            method = req.HttpMethod;
+            path = req.Url!.AbsolutePath.TrimEnd('/');
+        }
+        catch { return; } // 客户端已断开
+        var q = ctx.Request.QueryString;
+        using var sw = new MemoryStream();
+        try
+        {
+            ctx.Request.InputStream.CopyTo(sw);
+        }
+        catch { }
+        var body = sw.ToArray();
+
+        object result;
+        try
+        {
+            result = Route(path, q, body, method);
         }
         catch (Exception ex)
         {
-            Log.Write($"EnsureTranslations failed: {ex.Message}");
+            result = new Dictionary<string, object?> { ["error"] = ex.Message, ["type"] = ex.GetType().Name };
+        }
+
+        try
+        {
+            var json = JsonSerializer.Serialize(result, JsonOpts);
+            var buf = System.Text.Encoding.UTF8.GetBytes(json);
+            ctx.Response.ContentType = "application/json; charset=utf-8";
+            ctx.Response.Headers["Access-Control-Allow-Origin"] = "*";
+            ctx.Response.ContentLength64 = buf.Length;
+            ctx.Response.OutputStream.Write(buf, 0, buf.Length);
+            ctx.Response.Close();
+            Log.Write($"{method} {path} -> {json.Length} bytes");
+        }
+        catch { Log.Write($"{method} {path} -> client gone"); }
+    }
+
+    private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = false };
+
+    // ---------- 路由 ----------
+
+    private static object Route(string path, System.Collections.Specialized.NameValueCollection q, byte[] body, string method = "GET")
+    {
+        var game = GameContext.GetGame();
+        switch (path)
+        {
+            case "/health":
+                return Dict(
+                    ("bridge", Version),
+                    ("gameAttached", game != null));
+
+            case "/state": return Handlers.BuildState(game!);
+
+            case "/entities":
+                {
+                    RequireGame(game);
+                    var id = q.Get("id");
+                    var withOptions = q.Get("options") == "1";
+                    if (id != null) return Handlers.EntityDetail(game!, id, withOptions);
+                    return Handlers.ListEntities(game!);
+                }
+
+            case "/select":
+                {
+                    RequireGame(game);
+                    var p = ParseBody(body);
+                    return Handlers.SelectOption(game!, S(p, "entityId"), S(p, "optionId"));
+                }
+
+            case "/start":
+                {
+                    RequireGame(game);
+                    var p = ParseBody(body);
+                    return Handlers.StartAction(game!, S(p, "entityId"));
+                }
+
+            case "/stop":
+                {
+                    RequireGame(game);
+                    return Handlers.StopAll(game!);
+                }
+
+            case "/click":
+                {
+                    var p = ParseBody(body);
+                    return Handlers.Click(D(p, "x", 0.5), D(p, "y", 0.5), D(p, "hold", 0.0));
+                }
+
+            case "/screenshot": return Handlers.Screenshot(q);
+
+            case "/packages":
+                {
+                    var name = q.Get("name");
+                    return name != null ? Handlers.ReadPackage(name) : (object)Handlers.ListPackages();
+                }
+
+            case "/language":
+                {
+                    var p = ParseBody(body);
+                    return p.Count == 0 || p.TryGetValue("locale", out var _) == false
+                        ? Handlers.LanguageInfo()
+                        : Handlers.SetLanguage(S(p, "locale") ?? "");
+                }
+
+            case "/dir":
+                return Handlers.ListDir(q.Get("path") ?? "res://");
+
+            case "/project-setting":
+                {
+                    var name = q.Get("name") ?? throw new ArgumentException("name required");
+                    return Handlers.ReadProjectSetting(name);
+                }
+
+            case "/astrology":
+                {
+                    RequireGame(game);
+                    return method == "POST" ? Handlers.AstrologyUnlock(game!) : Handlers.Astrology(game!);
+                }
+
+            case "/bridge-log":
+                {
+                    int n = int.TryParse(q.Get("n"), out var v) ? v : 50;
+                    return Dict(("lines", Log.Tail(n)));
+                }
+
+            default:
+                return Dict(("error", $"unknown path {path}, try /health /state /entities /select /start /stop /screenshot /packages"));
         }
     }
 
-    /// <summary>读取 userSettings.json 里保存的 Language（steam/&lt;id&gt;/userSettings.json）。</summary>
-    private static string? ReadSavedLanguagePreference()
+    private static void RequireGame(object? game)
+    {
+        if (game == null)
+            throw new InvalidOperationException("game not attached (main menu? cloud login?) — load a save first");
+    }
+
+    internal static Dictionary<string, object?> Dict(params (string, object?)[] kv)
+    {
+        var d = new Dictionary<string, object?>();
+        foreach (var (k, v) in kv) d[k] = v;
+        return d;
+    }
+
+    private static Dictionary<string, object?> ParseBody(byte[] body)
+    {
+        if (body.Length == 0) return new();
+        return JsonSerializer.Deserialize<Dictionary<string, object?>>(body, JsonOpts) ?? new();
+    }
+
+    private static string? S(Dictionary<string, object?> d, string key)
+        => d.TryGetValue(key, out var v) && v != null ? v.ToString() : null;
+
+    private static double D(Dictionary<string, object?> d, string key, double def)
+        => d.TryGetValue(key, out var v) && v is JsonElement je && je.ValueKind == JsonValueKind.Number && je.TryGetDouble(out var d2) ? d2 : def;
+}
+
+/// <summary>所有业务 handler。此时 Godot 已就绪，允许强类型调用。</summary>
+public static class Handlers
+{
+    private const BindingFlags PI = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+    // ---------- 状态 ----------
+
+    public static object BuildState(object game)
+    {
+        var skills = new List<object>();
+        var leveledProp = game.GetType().GetProperty("LeveledEntities");
+        if (leveledProp?.GetValue(game) is IEnumerable leveled)
+        {
+            foreach (var e in leveled)
+            {
+                var et = e.GetType();
+                string? id = et.GetProperty("Id")?.GetValue(e) as string;
+                string? name = TryGetDisplay(et.GetProperty("DisplayName")?.GetValue(e));
+                var exp = et.GetProperty("Experience")?.GetValue(e);
+                var expT = exp?.GetType();
+                skills.Add(Server.Dict(
+                    ("id", id),
+                    ("name", name),
+                    ("level", expT?.GetProperty("Level")?.GetValue(exp)),
+                    ("levelCap", expT?.GetProperty("LevelCap")?.GetValue(exp))));
+            }
+        }
+
+        var active = new List<object>();
+        var am = GameContext.GetActionManager(game);
+        var acts = am?.GetType().GetProperty("ActiveActions")?.GetValue(am) as IEnumerable;
+        if (acts != null)
+        {
+            foreach (var a in acts)
+            {
+                var at = a.GetType();
+                var entity = at.GetProperty("Entity")?.GetValue(a);
+                var desc = DescribeAction(a);
+                active.Add(Server.Dict(
+                    ("entity", entity?.GetType().GetProperty("Id")?.GetValue(entity)),
+                    ("entityName", TryGetDisplay(entity?.GetType().GetProperty("DisplayName")?.GetValue(entity))),
+                    ("isStarted", at.GetProperty("IsStarted")?.GetValue(a)),
+                    ("description", desc)));
+            }
+        }
+
+        return Server.Dict(
+            ("now", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")),
+            ("skills", skills),
+            ("activeActions", active));
+    }
+
+    private static object? DescribeAction(object action)
     {
         try
         {
-            var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-            var baseDir = System.IO.Path.Combine(appData, "Games By Malcs", "Melvor Idle 2", "steam");
-            if (!System.IO.Directory.Exists(baseDir)) return null;
-            foreach (var f in System.IO.Directory.GetFiles(baseDir, "userSettings.json", System.IO.SearchOption.AllDirectories))
+            // 伐木: CuttingTree -> Tree；其它技能各有"当前选项"属性，这里找常见形态
+            foreach (var prop in action.GetType().GetProperties(PI))
             {
-                var doc = System.Text.Json.JsonDocument.Parse(System.IO.File.ReadAllText(f));
-                if (doc.RootElement.TryGetProperty("Language", out var lang) && lang.ValueKind == System.Text.Json.JsonValueKind.String)
-                    return lang.GetString();
+                var name = prop.Name;
+                if (name is "ActionTimer") continue;
+                var pt = prop.PropertyType;
+                if (pt.IsPrimitive || pt == typeof(string)) continue;
+                if (!name.Contains("Current") && !name.Contains("Selected") && !name.Contains("Cutting")) continue;
+                var val = prop.GetValue(action);
+                if (val == null) continue;
+                var vt = val.GetType();
+                if (vt == typeof(string) || pt.Namespace?.StartsWith("System") == true) continue;
+                var id = vt.GetProperty("Id")?.GetValue(val) as string;
+                var nm = TryGetDisplay(vt.GetProperty("DisplayName")?.GetValue(val));
+                if (id != null || nm != null) return $"{name}={id ?? nm}";
             }
         }
         catch { }
         return null;
     }
 
-    /// <summary>用全部参数默认值调用实例方法（Godot API 大量使用默认参数）。</summary>
-    private static object? InvokeWithDefaults(MethodInfo m, object? target)
+    // ---------- 实体 ----------
+
+    /// <summary>通用字典枚举（ReadOnlyDictionary&lt;K,V&gt; 无法 as 到 object 版本）。</summary>
+    internal static IEnumerable<(string?, object?)> EnumerateDict(object? dictObj)
     {
-        var args = m.GetParameters()
-            .Select(p => p.DefaultValue is DBNull ? (p.ParameterType.IsValueType ? Activator.CreateInstance(p.ParameterType) : null) : p.DefaultValue)
-            .ToArray();
-        return m.Invoke(target, args);
+        if (dictObj is not IEnumerable en) yield break;
+        foreach (var kv in en)
+        {
+            var kvt = kv.GetType();
+            yield return (kvt.GetProperty("Key")?.GetValue(kv) as string, kvt.GetProperty("Value")?.GetValue(kv));
+        }
     }
 
-    private static string DumpTree(Godot.Node node, int depth, int maxDepth)
+    public static object ListEntities(object game)
     {
-        var sb = new System.Text.StringBuilder();
-        try
+        var outList = new List<object>();
+        var entities = GameContext.GetEntities(game);
+        var getAll = entities?.GetType().GetMethod("GetAllObjects");
+        if (getAll?.Invoke(entities, null) is not IEnumerable all) return Server.Dict(("error", "no entities registry"));
+        foreach (var e in all)
         {
-            sb.AppendLine($"{new string(' ', depth * 2)}{node.Name} [{node.GetType().FullName}]");
-            if (depth >= maxDepth) { sb.AppendLine($"{new string(' ', (depth + 1) * 2)}..."); return sb.ToString(); }
-            int n = node.GetChildCount();
-            for (int i = 0; i < n && i < 40; i++)
-            {
-                var child = node.GetChild(i);
-                if (child != null) sb.Append(DumpTree(child, depth + 1, maxDepth));
-            }
+            var et = e.GetType();
+            var comps = EnumerateDict(et.GetProperty("Components")?.GetValue(e)).ToList();
+            var exp = et.GetProperty("Experience")?.GetValue(e);
+            outList.Add(Server.Dict(
+                ("id", et.GetProperty("Id")?.GetValue(e) as string),
+                ("name", TryGetDisplay(et.GetProperty("DisplayName")?.GetValue(e))),
+                ("level", exp != null ? exp.GetType().GetProperty("Level")?.GetValue(exp) : null),
+                ("components", comps.Select(c => c.Item1).ToList())));
         }
-        catch (Exception ex) { sb.AppendLine($"{new string(' ', depth * 2)}<error {ex.Message}>"); }
-        return sb.ToString();
+        return outList;
     }
 
-    private static Godot.Node? FindNodeByTypeFullName(Godot.Node node, string fullName)
+    public static object EntityDetail(object game, string id, bool withOptions)
     {
-        if (node.GetType().FullName == fullName) return node;
-        int n = node.GetChildCount();
-        for (int i = 0; i < n; i++)
+        var e = GetEntityById(game, id) ?? throw new InvalidOperationException($"entity '{id}' not found");
+        var et = e.GetType();
+        var comps = EnumerateDict(et.GetProperty("Components")?.GetValue(e)).ToList();
+
+        var compDump = new Dictionary<string, object?>();
+        foreach (var (k, comp) in comps)
+            compDump[k ?? "?"] = Dump.Shallow(comp, depth: 2);
+
+        object? options = null;
+        if (withOptions)
         {
-            var child = node.GetChild(i);
-            if (child == null) continue;
-            var found = FindNodeByTypeFullName(child, fullName);
-            if (found != null) return found;
+            var actionComp = comps.Select(c => c.Item2).FirstOrDefault(c =>
+                c != null && c.GetType().BaseTypeChain().Any(t => t.Name is "ActionComponent" or "BaseActionComponent"));
+            if (actionComp != null) options = Dump.Options(actionComp);
         }
+
+        return Server.Dict(
+            ("id", et.GetProperty("Id")?.GetValue(e) as string),
+            ("name", TryGetDisplay(et.GetProperty("DisplayName")?.GetValue(e))),
+            ("components", compDump),
+            ("options", options));
+    }
+
+    internal static object? GetEntityById(object game, string id)
+    {
+        var entities = GameContext.GetEntities(game);
+        var getAll = entities?.GetType().GetMethod("GetAllObjects");
+        if (getAll?.Invoke(entities, null) is not IEnumerable all) return null;
+        foreach (var e in all)
+            if (e.GetType().GetProperty("Id")?.GetValue(e) as string == id) return e;
         return null;
     }
 
-    /// <summary>当前 Game 实例（可能为 null：玩家退回主菜单时）。</summary>
-    public static object? GetGame()
+    internal static object? GetActionComponent(object game, string entityId)
     {
-        EnsureConnected();
-        var gd = _gameDriver;
-        var prop = _gameProp;
-        if (gd == null || prop == null) return null;
-        try { return prop.GetValue(gd); } catch { return null; }
+        var e = GetEntityById(game, entityId) ?? throw new InvalidOperationException($"entity '{entityId}' not found");
+        return EnumerateDict(e.GetType().GetProperty("Components")?.GetValue(e))
+            .Select(c => c.Item2)
+            .FirstOrDefault(c => c != null && c.GetType().BaseTypeChain().Any(t => t.Name == "ActionComponent"));
     }
 
-    /// <summary>
-    /// 未连接时主动在主线程重试一次（RunOnMainThread 的 CallDeferred 任何线程可安全调用）。
-    /// ctor 钩子在界面稳定后触发变少，这里补上轮询兜底。
-    /// </summary>
-    public static void EnsureConnected()
+    // ---------- 动作控制 ----------
+
+    public static object SelectOption(object game, string entityId, string optionId)
     {
-        if (_connected) return;
-        try
+        if (optionId == null) throw new ArgumentException("optionId required");
+        return GameContext.RunOnMainThread(() =>
         {
-            RunOnMainThread(() =>
+            var comp = GetActionComponent(game, entityId) ?? throw new InvalidOperationException($"no action component on '{entityId}'");
+
+            // 找 Select* 方法与匹配选项对象
+            var selects = comp.GetType().GetMethods(BindingFlags.Instance | BindingFlags.Public)
+                .Where(m => m.Name.StartsWith("Select") && m.GetParameters().Length == 1 && !m.IsGenericMethodDefinition)
+                .ToList();
+            foreach (var (argObj, argId, alt) in EnumerateOptionObjects(comp))
             {
-                if (_connected) return 0;
-                if (TryConnect())
+                if (argId != optionId) continue;
+                var m = selects.FirstOrDefault(s => s.GetParameters()[0].ParameterType.IsInstanceOfType(argObj));
+                object? arg = argObj;
+                if (m == null && alt != null)
                 {
-                    _connected = true;
-                    Log.Write("connected to game (ensure path).");
+                    // id 在 Recipe 上、Select 吃 value 的场景（如伐木 SelectTree(Tree)）
+                    m = selects.FirstOrDefault(s => s.GetParameters()[0].ParameterType.IsInstanceOfType(alt));
+                    if (m != null) arg = alt;
                 }
-                return 0;
-            }, timeoutMs: 3000);
+                if (m == null)
+                    throw new InvalidOperationException($"no Select method accepts {argObj.GetType().Name}");
+                var r = m.Invoke(comp, new[] { arg });
+                return Server.Dict(
+                    ("selected", optionId),
+                    ("method", m.Name),
+                    ("argType", arg.GetType().Name),
+                    ("invokeResult", r?.ToString() ?? "(void)"),
+                    ("isStarted", comp.GetType().GetProperty("IsStarted")?.GetValue(comp)));
+            }
+            throw new InvalidOperationException($"option '{optionId}' not found on '{entityId}'");
+        });
+    }
+
+    public static object StartAction(object game, string entityId)
+    {
+        return GameContext.RunOnMainThread(() =>
+        {
+            var comp = GetActionComponent(game, entityId) ?? throw new InvalidOperationException($"no action component on '{entityId}'");
+            var tryStart = comp.GetType().GetMethod("TryStart", Type.EmptyTypes)
+                ?? throw new InvalidOperationException("no TryStart");
+            var ok = (bool)tryStart.Invoke(comp, null)!;
+            return Server.Dict(("ok", ok), ("isStarted", comp.GetType().GetProperty("IsStarted")?.GetValue(comp)));
+        });
+    }
+
+    public static object StopAll(object game)
+    {
+        return GameContext.RunOnMainThread(() =>
+        {
+            var am = GameContext.GetActionManager(game) ?? throw new InvalidOperationException("no action manager");
+            var stop = am.GetType().GetMethod("TryStopActive", new[] { typeof(bool) })!;
+            var ok = (bool)stop.Invoke(am, new object[] { true })!;
+            return Server.Dict(("ok", ok));
+        });
+    }
+
+    // ---------- 运行时文件系统/项目设置（PCK 在运行时目录已解密） ----------
+
+    public static object ListDir(string path)
+    {
+        var outList = new List<string>();
+        GameContext.RunOnMainThread(() =>
+        {
+            var dir = Godot.DirAccess.Open(path);
+            if (dir == null) return;
+            dir.ListDirBegin();
+            while (dir.GetNext() is { } f && f.Length > 0) outList.Add(f);
+            dir.ListDirEnd();
+        });
+        return Server.Dict(("path", path), ("entries", outList));
+    }
+
+    public static object ReadProjectSetting(string name)
+    {
+        return GameContext.RunOnMainThread<object>(() =>
+        {
+            var v = Godot.ProjectSettings.GetSetting(name);
+            return Server.Dict(("name", name), ("value", Godot.Variant.From(v).ToString()));
+        });
+    }
+
+    // ---------- 星象学 ----------
+
+    public static object Astrology(object game)
+    {
+        var comp = GetActionComponent(game, "MelvorBase:Astrology")
+            ?? throw new InvalidOperationException("astrology action component not found");
+        return GameContext.RunOnMainThread<object>(() =>
+        {
+            object? P(object? o, string name) => o?.GetType().GetProperty(name)?.GetValue(o);
+            var sc = P(comp, "StudiedConstellation");
+            var constellation = P(sc, "Constellation");
+            return Server.Dict(
+                ("studied", P(constellation, "Id")),
+                ("knowledge", P(sc, "Knowledge")),
+                ("minorUnlocked", P(sc, "MinorNodeUnlockCount")),
+                ("minorAvailable", P(sc, "AvailableMinorNodeCount")),
+                ("majorUnlocked", P(sc, "MajorNodeUnlockCount")),
+                ("majorAvailable", P(sc, "AvailableMajorNodeCount")),
+                ("isStarted", P(comp, "IsStarted")));
+        });
+    }
+
+    /// <summary>解锁当前星座全部可解节点（小节点优先，条件不满足的自动跳过）。</summary>
+    public static object AstrologyUnlock(object game)
+    {
+        var comp = GetActionComponent(game, "MelvorBase:Astrology")
+            ?? throw new InvalidOperationException("astrology action component not found");
+        return GameContext.RunOnMainThread<object>(() =>
+        {
+            object? P(object? o, string name) => o?.GetType().GetProperty(name)?.GetValue(o);
+            var sc = P(comp, "StudiedConstellation") ?? throw new InvalidOperationException("no studied constellation");
+            var unlockMinor = sc.GetType().GetMethod("UnlockMinorNode")!;
+            var unlockMajor = sc.GetType().GetMethod("UnlockMajorNode")!;
+            var isMinorUnlockedM = sc.GetType().GetMethod("IsMinorNodeUnlocked")!;
+            var isMajorUnlockedM = sc.GetType().GetMethod("IsMajorNodeUnlocked")!;
+
+            static bool RequirementsMet(object? node)
+            {
+                var req = node?.GetType().GetProperty("UnlockRequirements")?.GetValue(node);
+                var areMet = req?.GetType().GetProperty("AreMet")?.GetValue(req);
+                return areMet is null or true;
+            }
+
+            bool Progress(IEnumerable nodes, MethodInfo unlock, Func<object, bool> already, Func<object, bool> met, List<string> acc)
+            {
+                foreach (var n in nodes)
+                {
+                    if (already(n)) continue;
+                    if (!met(n)) continue;
+                    if ((bool)unlock.Invoke(sc, new[] { n })!)
+                    {
+                        acc.Add(P(n, "Id") as string ?? "?");
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            var minorNodes = P(P(sc, "Constellation"), "MinorNodes") as IEnumerable ?? Array.Empty<object>();
+            var majorNodes = P(P(sc, "Constellation"), "MajorNodes") as IEnumerable ?? Array.Empty<object>();
+            var unlocked = new List<string>();
+            bool changed = true;
+            while (changed)
+            {
+                changed = false;
+                if (Progress(minorNodes, unlockMinor,
+                        n => (bool)isMinorUnlockedM.Invoke(sc, new[] { n })!, RequirementsMet, unlocked))
+                { changed = true; continue; }
+                if (Progress(majorNodes, unlockMajor,
+                        n => (bool)isMajorUnlockedM.Invoke(sc, new[] { n })!, RequirementsMet, unlocked))
+                { changed = true; }
+            }
+
+            return Server.Dict(
+                ("unlockedNodes", unlocked),
+                ("count", unlocked.Count),
+                ("knowledge", P(sc, "Knowledge")),
+                ("minorUnlocked", P(sc, "MinorNodeUnlockCount")),
+                ("minorAvailable", P(sc, "AvailableMinorNodeCount")),
+                ("majorUnlocked", P(sc, "MajorNodeUnlockCount")),
+                ("majorAvailable", P(sc, "AvailableMajorNodeCount")));
+        });
+    }
+
+    // ---------- 语言 ----------
+
+    private static (object? user, System.Reflection.PropertyInfo langProp) GetUserSettings()
+    {
+        var lsm = Type.GetType("GamesByMalcs.Melvor2.Settings.LocalSettingsManager, GamesByMalcs.Melvor2")
+            ?? throw new InvalidOperationException("LocalSettingsManager type not found");
+        var user = lsm.GetProperty("User", BindingFlags.Static | BindingFlags.Public)?.GetValue(null)
+            ?? throw new InvalidOperationException("LocalSettingsManager.User is null");
+        var langProp = user.GetType().GetProperty("Language")
+            ?? throw new InvalidOperationException("UserSettings.Language prop not found");
+        return (user, langProp);
+    }
+
+    public static object LanguageInfo()
+    {
+        return GameContext.RunOnMainThread<object>(() =>
+        {
+            var (user, langProp) = GetUserSettings();
+            var current = langProp.GetValue(user) as string;
+            var loaded = Godot.TranslationServer.GetLoadedLocales().ToList();
+            return Server.Dict(("current", current), ("loadedLocales", loaded));
+        });
+    }
+
+    public static object SetLanguage(string locale)
+    {
+        return GameContext.RunOnMainThread<object>(() =>
+        {
+            var (user, langProp) = GetUserSettings();
+            langProp.SetValue(user, locale);
+            var now = langProp.GetValue(user) as string;
+            return Server.Dict(("requested", locale), ("current", now),
+                ("ok", now == locale), ("activeLocale", Godot.TranslationServer.GetLocale()));
+        });
+    }
+
+    // ---------- 通用 UI 点击（归一化坐标 0..1） ----------
+
+    public static object Click(double nx, double ny, double holdMs)
+    {
+        var r = GameContext.RunOnMainThread<string?>(() =>
+        {
+            var root = (Godot.Engine.GetMainLoop() as Godot.SceneTree)?.Root;
+            if (root == null) return null;
+            var size = root.Size;
+            var pos = new Godot.Vector2((float)(nx * size.X), (float)(ny * size.Y));
+            var motion = new Godot.InputEventMouseMotion { Position = pos, GlobalPosition = pos };
+            Godot.Input.ParseInputEvent(motion);
+            var press = new Godot.InputEventMouseButton
+            {
+                Position = pos, GlobalPosition = pos,
+                ButtonIndex = Godot.MouseButton.Left, Pressed = true,
+            };
+            Godot.Input.ParseInputEvent(press);
+            if (holdMs > 0) Thread.Sleep((int)holdMs);
+            var release = new Godot.InputEventMouseButton
+            {
+                Position = pos, GlobalPosition = pos,
+                ButtonIndex = Godot.MouseButton.Left, Pressed = false,
+            };
+            Godot.Input.ParseInputEvent(release);
+            return $"clicked ({pos.X:0},{pos.Y:0}) of {size.X:0}x{size.Y:0}";
+        });
+        return Server.Dict(("result", r ?? "no viewport"));
+    }
+
+    // ---------- 截图 ----------
+
+    public static object Screenshot(System.Collections.Specialized.NameValueCollection q)
+    {
+        var png = GameContext.RunOnMainThread<byte[]?>(() =>
+        {
+            var vp = Godot.Engine.GetMainLoop() as Godot.SceneTree;
+            var root = vp?.Root;
+            if (root == null) return null;
+            var img = root.GetViewport().GetTexture().GetImage();
+            int w = q.Get("width") is string ws && int.TryParse(ws, out var wv) ? wv : 960;
+            if (w > 0 && img.GetSize().X > w)
+            {
+                float ratio = img.GetSize().Y / img.GetSize().X;
+                img.Resize(w, (int)(w * ratio));
+            }
+            return img.SavePngToBuffer();
+        }) ?? throw new InvalidOperationException("viewport not available");
+        return Server.Dict(("pngBase64", Convert.ToBase64String(png)), ("bytes", png.Length));
+    }
+
+    // ---------- 数据包 ----------
+
+    public static object ListPackages()
+    {
+        var files = new List<string>();
+        GameContext.RunOnMainThread(() =>
+        {
+            var dir = Godot.DirAccess.Open("res://Data/Packages");
+            if (dir == null) return;
+            dir.ListDirBegin();
+            while (dir.GetNext() is { } f && f.Length > 0) if (f.EndsWith(".json")) files.Add(f);
+            dir.ListDirEnd();
+        });
+        return Server.Dict(("namespace", "res://Data/Packages/"), ("files", files));
+    }
+
+    public static object ReadPackage(string name)
+    {
+        if (!name.EndsWith(".json")) name += ".json";
+        if (name.Contains("..") || name.Contains('/') || name.Contains('\\'))
+            throw new ArgumentException("bad package name");
+        var text = GameContext.RunOnMainThread<string?>(() =>
+        {
+            using var fa = Godot.FileAccess.Open($"res://Data/Packages/{name}", Godot.FileAccess.ModeFlags.Read);
+            return fa?.GetAsText();
+        }) ?? throw new InvalidOperationException($"cannot open {name}");
+        return Server.Dict(("name", name), ("chars", text.Length), ("json", JsonDocument.Parse(text).RootElement.Clone()));
+    }
+
+    // ---------- 工具 ----------
+
+    internal static string? TryGetDisplay(object? displayName)
+    {
+        if (displayName == null) return null;
+        var t = displayName.GetType();
+        if (t.Name == "LocalizedString")
+        {
+            try { return t.GetProperty("Text")?.GetValue(displayName) as string; } catch { }
         }
-        catch { /* 主线程忙或未就绪，下次再试 */ }
-    }
-
-    public static object? GetActionManager(object? game = null)
-    {
-        game ??= GetGame();
-        return game?.GetType().GetProperty("ActionManager")?.GetValue(game);
-    }
-
-    public static object? GetEntities(object? game = null)
-    {
-        game ??= GetGame();
-        return game?.GetType().GetProperty("Entities")?.GetValue(game);
+        try { return displayName.ToString(); } catch { return $"<{t.Name}>"; }
     }
 
     /// <summary>
-    /// 把操作投递到 Godot 主线程执行（Callable.From(action).CallDeferred()）。
-    /// Godot 的 call_deferred 队列线程安全。同步等待结果，超时抛 TimeoutException。
-    /// 注意：本方法只在游戏运行期间（GodotSharp 已加载）被 HTTP handler 调用。
+    /// 枚举动作组件上的全部可选对象：(对象, id, 配对对象)。
+    /// 字典容器里 id 常在 Recipe(key) 上，而 Select 方法可能吃 value —— 配对对象作为回退候选。
     /// </summary>
-    public static T? RunOnMainThread<T>(Func<T> fn, int timeoutMs = 15000)
+    internal static IEnumerable<(object obj, string id, object? alt)> EnumerateOptionObjects(object component)
     {
-        T? result = default;
-        var done = new ManualResetEventSlim(false);
-        Exception? err = null;
-
-        Godot.Callable.From((Action)(() =>
+        foreach (var prop in component.GetType().GetProperties(BindingFlags.Instance | BindingFlags.Public))
         {
-            try { result = fn(); }
-            catch (Exception ex) { err = ex; Log.Write($"main-thread action failed: {ex}"); }
-            finally { done.Set(); }
-        })).CallDeferred();
+            object? val;
+            try { val = prop.GetValue(component); } catch { continue; }
+            if (val == null) continue;
+            if (val is not IEnumerable en || val is string) continue;
 
-        if (!done.Wait(timeoutMs))
-            throw new TimeoutException($"main thread did not process within {timeoutMs}ms");
-        if (err != null) throw err;
-        return result;
+            foreach (var item in en)
+            {
+                var it = item.GetType();
+                if (it.IsGenericType && it.GetGenericTypeDefinition().Name.StartsWith("KeyValuePair"))
+                {
+                    var k = it.GetProperty("Key")?.GetValue(item);
+                    var v = it.GetProperty("Value")?.GetValue(item);
+                    var kid = GetId(k);
+                    if (kid != null && k != null) yield return (k, kid, v);
+                    var vid = GetId(v);
+                    if (vid != null && v != null) yield return (v, vid, k);
+                }
+                else if (item is DictionaryEntry de)
+                {
+                    var kid = GetId(de.Key);
+                    if (kid != null && de.Key != null) yield return (de.Key, kid, de.Value);
+                    var vid = GetId(de.Value);
+                    if (vid != null && de.Value != null) yield return (de.Value, vid, de.Key);
+                }
+                else
+                {
+                    var id = GetId(item);
+                    if (id != null) yield return (item, id, null);
+                }
+            }
+        }
     }
 
-    public static void RunOnMainThread(Action fn, int timeoutMs = 15000) =>
-        RunOnMainThread<object?>(() => { fn(); return null; }, timeoutMs);
+    internal static string? GetId(object? o)
+    {
+        if (o == null) return null;
+        return o.GetType().GetProperty("Id")?.GetValue(o) as string;
+    }
+}
+
+/// <summary>反射 dump 工具：把游戏对象安全压平成 JSON 友好结构。</summary>
+public static class Dump
+{
+    public static object? Shallow(object o, int depth)
+    {
+        if (o == null) return null;
+        var t = o.GetType();
+        if (t.IsPrimitive || t == typeof(string) || t == typeof(decimal) || t.IsEnum)
+            return t.IsEnum ? o.ToString() : o;
+
+        if (depth <= 0) return $"<{t.Name}>";
+        if (t.Namespace?.StartsWith("System.Collections") == true || o is IEnumerable)
+        {
+            if (o is string) return o;
+            var list = new List<object?>();
+            int i = 0;
+            foreach (var x in (IEnumerable)o) { if (++i > 64) { list.Add($"...({i}+)"); break; } list.Add(Shallow(x, depth - 1)); }
+            return list;
+        }
+
+        var d = new Dictionary<string, object?>();
+        foreach (var p in t.GetProperties(BindingFlags.Instance | BindingFlags.Public))
+        {
+            try
+            {
+                var pt = p.PropertyType;
+                if (pt.Namespace?.StartsWith("Godot") == true)
+                {
+                    // Godot 原生类型只取名字，避免触发 native 副作用
+                    if (pt.Name == "Texture2D" || pt.Name == "AudioStream" || pt.BaseType?.Name == "Resource") { d[p.Name] = $"<{pt.Name}>"; continue; }
+                }
+                var v = p.GetValue(o);
+                if (v == null) { d[p.Name] = null; continue; }
+                var vt = v.GetType();
+                if (vt.IsPrimitive || vt == typeof(string) || vt.IsEnum || vt == typeof(decimal))
+                    d[p.Name] = vt.IsEnum ? v.ToString() : v;
+                else if (vt.Name == "LocalizedString")
+                    d[p.Name] = vt.GetProperty("Text")?.GetValue(v);
+                else
+                    d[p.Name] = $"<{vt.Name}>";
+            }
+            catch { d[p.Name] = "<error>"; }
+        }
+        return d;
+    }
+
+    /// <summary>动作组件的可选项列表（树/鱼/矿石…），通用反射发现。</summary>
+    public static object Options(object actionComponent)
+    {
+        var t = actionComponent.GetType();
+        var result = new List<object>();
+        int scanned = 0;
+        foreach (var prop in t.GetProperties(BindingFlags.Instance | BindingFlags.Public))
+        {
+            object? val;
+            try { val = prop.GetValue(actionComponent); } catch { continue; }
+            if (val == null) continue;
+            if (val is not IEnumerable en || val is string) continue;
+
+            foreach (var item in en)
+            {
+                if (++scanned > 200) goto done;
+                string? id = null; string? name = null; string? kind = null;
+                object? target = item;
+
+                // ReadOnlyDictionary 枚举出 KeyValuePair<K,V>（结构体）；IDictionary 枚举出 DictionaryEntry
+                var it = item.GetType();
+                if (it.IsGenericType && it.GetGenericTypeDefinition().Name.StartsWith("KeyValuePair"))
+                {
+                    target = it.GetProperty("Key")?.GetValue(item);
+                    if (target == null || target.GetType().GetProperty("Id") == null)
+                        target = it.GetProperty("Value")?.GetValue(item);
+                }
+                else if (item is DictionaryEntry de)
+                {
+                    // 优先 key（Recipe 有 Id/DisplayName），value 是运行时状态
+                    target = de.Key;
+                    if (target == null || target.GetType().GetProperty("Id") == null) target = de.Value;
+                }
+
+                if (target != null)
+                {
+                    var tt = target.GetType();
+                    id = tt.GetProperty("Id")?.GetValue(target) as string;
+                    var dn = tt.GetProperty("DisplayName")?.GetValue(target);
+                    name = dn?.GetType().GetProperty("Text")?.GetValue(dn) as string ?? dn?.ToString();
+                    kind = tt.Name;
+                }
+                if (id != null)
+                    result.Add(Server.Dict(("id", id), ("name", name), ("type", kind), ("from", prop.Name)));
+            }
+        }
+    done:
+        return result.DistinctBy(x => ((Dictionary<string, object?>)x).TryGetValue("id", out var v) ? v : null).ToList();
+    }
+}
+
+public static class ReflectExt
+{
+    public static IEnumerable<Type> BaseTypeChain(this Type t)
+    {
+        var cur = t;
+        while (cur != null) { yield return cur; cur = cur.BaseType!; }
+    }
 }
