@@ -98,6 +98,10 @@ curl -s -X POST -d '{"locale":""}'       http://127.0.0.1:27500/language   # 自
 
 **验证**：`GET /state` 的技能名变为中文（伐木/采矿/钓鱼…）即已生效。
 
+**游戏又变英文 = 桥没加载**（两种原因：游戏版本更新后 Steam 还原了注入文件 / 玩家从 Steam 客户端直接启动绕过了桥）。
+自愈方法：关掉游戏后运行 `powershell -ExecutionPolicy Bypass -File <本仓库>/dist/launch-melvor-bridge.ps1`——
+该脚本会自动检测注入状态、游戏更新后自动重注入，再带桥启动，语言随即恢复。不要让玩家从 Steam 客户端直接启动。
+
 ## 一轮协作怎么走
 
 1. **看局面**：`GET /state`，用一两句话告诉玩家现状（等级、在做什么）

@@ -31,6 +31,21 @@ if (-not (Test-Path $appidFile)) {
     Write-Host "[bridge] 已写入 $appidFile (3218350)"
 }
 
+# 启动前确保注入仍在（游戏更新后 Steam 会还原 GodotSharp.dll，这里自动重注入）
+$InjectorDll = Join-Path $PSScriptRoot 'injector\Injector.dll'
+$InjectorBridge = Join-Path $PSScriptRoot 'MelvorBridge.dll'
+$GameSharp = Join-Path $GameDir 'data_GamesByMalcs.Melvor2_windows_x86_64\GodotSharp.dll'
+if ((Test-Path $InjectorDll) -and (Test-Path $GameSharp)) {
+    $status = (dotnet $InjectorDll status $GameSharp 2>$null) -join ' '
+    if ($status -notmatch 'injected: True') {
+        Write-Host '[bridge] 注入缺失（游戏可能更新过），重新注入...'
+        dotnet $InjectorDll inject $GameSharp $InjectorBridge
+        if ($LASTEXITCODE -ne 0) { throw '注入失败，请查看上方输出' }
+    } else {
+        Write-Host '[bridge] 注入完好'
+    }
+}
+
 # 若游戏已在跑，直接提示（桥随进程注入，重启才生效）
 $running = Get-Process -Name 'Melvor2' -ErrorAction SilentlyContinue
 if ($running) {

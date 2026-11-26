@@ -50,11 +50,23 @@ public static class GameContext
         finally { _connecting = false; }
     }
 
+    private static string? _lastFailReason;
+    private static DateTime _lastFailLog = DateTime.MinValue;
+
+    private static void FailLog(string reason)
+    {
+        // 同原因 15 秒最多记一次，避免云登录等界面刷爆日志
+        if (reason == _lastFailReason && (DateTime.UtcNow - _lastFailLog).TotalSeconds < 15) return;
+        _lastFailReason = reason;
+        _lastFailLog = DateTime.UtcNow;
+        Log.Write($"connect: {reason}");
+    }
+
     private static bool TryConnect()
     {
         var sceneTree = Godot.Engine.GetMainLoop() as Godot.SceneTree;
         var root = sceneTree?.Root;
-        if (root == null) { Log.Write("connect: no root"); return false; }
+        if (root == null) { FailLog("no root"); return false; }
 
         var mainNode = FindNodeByTypeFullName(root, "GamesByMalcs.Melvor2.Main");
         if (mainNode == null)
@@ -64,18 +76,19 @@ public static class GameContext
                 _treeDumped = true;
                 Log.Write("scene tree dump:\n" + DumpTree(root, 0, 4));
             }
+            FailLog("Main node not found");
             return false;
         }
 
         var gdProp = mainNode.GetType().GetProperty("GameDriver", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-        if (gdProp == null) { Log.Write("connect: no GameDriver prop"); return false; }
+        if (gdProp == null) { FailLog("no GameDriver prop"); return false; }
         var gd = gdProp.GetValue(mainNode);
-        if (gd == null) { Log.Write("connect: GameDriver null"); return false; }
+        if (gd == null) { FailLog("GameDriver null"); return false; }
 
         var gameProp = gd.GetType().GetProperty("Game", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-        if (gameProp == null) { Log.Write("connect: no Game prop"); return false; }
+        if (gameProp == null) { FailLog("no Game prop"); return false; }
         var game = gameProp.GetValue(gd);
-        if (game == null) { Log.Write("connect: game not bound yet (menu?)"); return false; }
+        if (game == null) { FailLog("game not bound yet (menu?)"); return false; }
 
         _gameDriver = gd;
         _gameProp = gameProp;
