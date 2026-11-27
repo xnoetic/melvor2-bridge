@@ -98,6 +98,16 @@ curl -s -X POST -d '{"locale":""}'       http://127.0.0.1:27500/language   # 自
 
 **验证**：`GET /state` 的技能名变为中文（伐木/采矿/钓鱼…）即已生效。
 
+## 星象学操作（ astrology 端点）
+
+- `GET /astrology`：当前研究进度（knowledge/节点数）
+- `POST /astrology {"study":"MelvorBase:Ko"}`：切换研究星座并自动开始
+  ⚠️ **toggle 行为**：对当前正在研究的星座再次 study = 停止研究。确认 `activeActions` 后再操作。
+- `POST /astrology {}`（空/任意无 study 键 body）：解锁全部可解节点
+
+桥已内置解锁条件校验（Requirements + Secondary + Display 三组，与 UI 一致）——
+被拒绝时会返回具体差什么（例如"防御等级8 | 屠杀者等级8"）。**绝不绕过游戏解锁条件**。
+
 **游戏又变英文 = 桥没加载**（两种原因：游戏版本更新后 Steam 还原了注入文件 / 玩家从 Steam 客户端直接启动绕过了桥）。
 自愈方法：关掉游戏后运行 `powershell -ExecutionPolicy Bypass -File <本仓库>/dist/launch-melvor-bridge.ps1`——
 该脚本会自动检测注入状态、游戏更新后自动重注入，再带桥启动，语言随即恢复。不要让玩家从 Steam 客户端直接启动。

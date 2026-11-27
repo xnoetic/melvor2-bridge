@@ -542,6 +542,26 @@ public static class Handlers
                 var key = kvt.GetProperty("Key")?.GetValue(kv);          // AstrologyConstellation
                 var val = kvt.GetProperty("Value")?.GetValue(kv);        // ActiveAstrologyConstellation
                 if (P(key, "Id") as string != constellationId) continue;
+
+                // 尊重游戏的解锁条件（UI 层 = Requirements + Secondary + Display 三组全部满足，API 不得绕过）
+                var gateDescs = new List<string>();
+                foreach (var reqName in new[] { "Requirements", "SecondaryRequirements", "DisplayRequirements" })
+                {
+                    var reqs = P(key, reqName);
+                    if (reqs == null) continue;
+                    if (reqs.GetType().GetProperty("AreMet")?.GetValue(reqs) as bool? != false) continue;
+                    var conds = reqs.GetType().GetProperty("Conditions")?.GetValue(reqs) as System.Collections.IEnumerable;
+                    var getDesc = reqs.GetType().Assembly.GetType("GamesByMalcs.Melvor2.Conditions.Condition")?.GetMethod("GetDescription", new[] { typeof(bool), typeof(bool) });
+                    if (conds != null && getDesc != null)
+                        foreach (var c in conds)
+                        {
+                            var d = getDesc.Invoke(c, new object[] { false, false }) as string;
+                            if (!string.IsNullOrEmpty(d)) gateDescs.Add(d);
+                        }
+                }
+                if (gateDescs.Count > 0)
+                    throw new InvalidOperationException($"constellation locked by requirements: {string.Join(" | ", gateDescs)}");
+
                 study.Invoke(comp, new[] { val });
                 return Server.Dict(
                     ("studying", constellationId),
