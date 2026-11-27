@@ -463,7 +463,7 @@ public static class Handlers
         });
     }
 
-    /// <summary>解锁当前星座全部可解节点（小节点优先，条件不满足的自动跳过）。</summary>
+    /// <summary>解锁全部已激活星座的可解节点（小节点优先，条件不满足的自动跳过）。</summary>
     public static object AstrologyUnlock(object game)
     {
         var comp = GetActionComponent(game, "MelvorBase:Astrology")
@@ -471,7 +471,33 @@ public static class Handlers
         return GameContext.RunOnMainThread<object>(() =>
         {
             object? P(object? o, string name) => o?.GetType().GetProperty(name)?.GetValue(o);
-            var sc = P(comp, "StudiedConstellation") ?? throw new InvalidOperationException("no studied constellation");
+            // 遍历所有已激活星座（研究中的优先排第一）
+            var actives = new List<(string id, object sc)>();
+            var cur = P(comp, "StudiedConstellation");
+            if (cur != null) actives.Add((P(P(cur, "Constellation"), "Id") as string ?? "?", cur));
+            foreach (var kv in (System.Collections.IEnumerable)P(comp, "ActiveConstellations")!)
+            {
+                var kvt = kv.GetType();
+                var key = kvt.GetProperty("Key")?.GetValue(kv);
+                var val = kvt.GetProperty("Value")?.GetValue(kv)!;
+                var id = P(key, "Id") as string ?? "?";
+
+                // 只处理已正式解锁的星座（与 UI 一致的三组条件），防止绕过星座门槛
+                bool gated = false;
+                foreach (var reqName in new[] { "Requirements", "SecondaryRequirements", "DisplayRequirements" })
+                {
+                    var reqs = P(key, reqName);
+                    if (reqs == null) continue;
+                    if (reqs.GetType().GetProperty("AreMet")?.GetValue(reqs) as bool? == false) { gated = true; break; }
+                }
+                if (gated) continue;
+
+                if (!actives.Any(a => a.id == id)) actives.Add((id, val));
+            }
+            var result = new Dictionary<string, object?>();
+            foreach (var (id, sc0) in actives)
+            {
+                var sc = sc0;
             var unlockMinor = sc.GetType().GetMethod("UnlockMinorNode")!;
             var unlockMajor = sc.GetType().GetMethod("UnlockMajorNode")!;
             var isMinorUnlockedM = sc.GetType().GetMethod("IsMinorNodeUnlocked")!;
@@ -514,14 +540,15 @@ public static class Handlers
                 { changed = true; }
             }
 
-            return Server.Dict(
-                ("unlockedNodes", unlocked),
-                ("count", unlocked.Count),
-                ("knowledge", P(sc, "Knowledge")),
-                ("minorUnlocked", P(sc, "MinorNodeUnlockCount")),
-                ("minorAvailable", P(sc, "AvailableMinorNodeCount")),
-                ("majorUnlocked", P(sc, "MajorNodeUnlockCount")),
-                ("majorAvailable", P(sc, "AvailableMajorNodeCount")));
+                result[id] = Server.Dict(
+                    ("unlocked", unlocked),
+                    ("knowledge", P(sc, "Knowledge")),
+                    ("minorUnlocked", P(sc, "MinorNodeUnlockCount")),
+                    ("minorAvailable", P(sc, "AvailableMinorNodeCount")),
+                    ("majorUnlocked", P(sc, "MajorNodeUnlockCount")),
+                    ("majorAvailable", P(sc, "AvailableMajorNodeCount")));
+            }
+            return result;
         });
     }
 
