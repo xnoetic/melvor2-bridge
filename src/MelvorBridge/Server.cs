@@ -156,7 +156,13 @@ public static class Server
             case "/astrology":
                 {
                     RequireGame(game);
-                    return method == "POST" ? Handlers.AstrologyUnlock(game!) : Handlers.Astrology(game!);
+                    if (method == "POST")
+                    {
+                        var p2 = ParseBody(body);
+                        var study = p2.TryGetValue("study", out var st) ? st?.ToString() : null;
+                        return study != null ? Handlers.StudyConstellation(game!, study) : Handlers.AstrologyUnlock(game!);
+                    }
+                    return Handlers.Astrology(game!);
                 }
 
             case "/bridge-log":
@@ -516,6 +522,37 @@ public static class Handlers
                 ("minorAvailable", P(sc, "AvailableMinorNodeCount")),
                 ("majorUnlocked", P(sc, "MajorNodeUnlockCount")),
                 ("majorAvailable", P(sc, "AvailableMajorNodeCount")));
+        });
+    }
+
+    /// <summary>切换研究星座（自动开始研究）。传入星座实体 Id，如 MelvorBase:Ko。</summary>
+    public static object StudyConstellation(object game, string constellationId)
+    {
+        var comp = GetActionComponent(game, "MelvorBase:Astrology")
+            ?? throw new InvalidOperationException("astrology action component not found");
+        return GameContext.RunOnMainThread<object>(() =>
+        {
+            object? P(object? o, string name) => o?.GetType().GetProperty(name)?.GetValue(o);
+            var actives = P(comp, "ActiveConstellations");
+            var study = comp.GetType().GetMethod("StudyConstellation", new[] { Type.GetType("GamesByMalcs.Melvor2.Entities.Astrology.ActiveAstrologyConstellation, GamesByMalcs.Melvor2") })
+                ?? comp.GetType().GetMethods().First(m => m.Name == "StudyConstellation");
+            foreach (var kv in (System.Collections.IEnumerable)actives!)
+            {
+                var kvt = kv.GetType();
+                var key = kvt.GetProperty("Key")?.GetValue(kv);          // AstrologyConstellation
+                var val = kvt.GetProperty("Value")?.GetValue(kv);        // ActiveAstrologyConstellation
+                if (P(key, "Id") as string != constellationId) continue;
+                study.Invoke(comp, new[] { val });
+                return Server.Dict(
+                    ("studying", constellationId),
+                    ("isStarted", P(comp, "IsStarted")),
+                    ("knowledge", P(val, "Knowledge")),
+                    ("minorUnlocked", P(val, "MinorNodeUnlockCount")),
+                    ("minorAvailable", P(val, "AvailableMinorNodeCount")),
+                    ("majorUnlocked", P(val, "MajorNodeUnlockCount")),
+                    ("majorAvailable", P(val, "AvailableMajorNodeCount")));
+            }
+            throw new InvalidOperationException($"constellation '{constellationId}' not active/available (level gate?)");
         });
     }
 
